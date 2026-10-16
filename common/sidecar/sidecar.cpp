@@ -28,6 +28,7 @@
 #endif
 
 #include "game/gamescript.h"
+#include "world/objects/interactive.h"
 #include "world/objects/npc.h"
 #include "world/aiqueue.h"
 #include "world/waypoint.h"
@@ -41,13 +42,22 @@ namespace {
 constexpr uint32_t    ProtocolVersion   = 0;
 constexpr size_t      MaxFrame          = size_t(1) << 20;
 constexpr auto        ReconnectInterval = std::chrono::seconds(2);
-constexpr auto        DecideTimeout     = std::chrono::seconds(3);
+// World ticks, in milliseconds: they stop while the game is paused, wall time doesn't
+constexpr uint64_t    DecideTimeout     = 3'000;
+constexpr uint64_t    RunTimeout        = 60'000;
+constexpr uint64_t    TelemetryInterval = 1'000;
+constexpr size_t      MaxQueueShown     = 8;
 constexpr size_t      MaxWaypoints      = 8;
 constexpr int         WaypointHops      = 2;
 constexpr float       ArrivedDistance   = 200.f; // centimetres
 constexpr int         SayTime           = 3;     // seconds
 constexpr int         SayPosY           = 75;    // percent of the screen height
 constexpr const char* SayFont           = "font_old_10_white.tga";
+
+// Values of an aborted result's `reason`
+constexpr const char* AbortQueueCleared  = "queue cleared";
+constexpr const char* AbortQueueRanEmpty = "queue ran empty";
+constexpr const char* AbortTimeout       = "timeout";
 
 // Unicode code points of CP1251 bytes 0x80..0xFF; 0 marks an unassigned byte.
 // v0 supports only the Russian code page.
@@ -226,6 +236,111 @@ const char* perceptionName(PercType perc) {
   return "unknown";
   }
 
+const char* aiName(NpcProcessPolicy p) {
+  switch(p) {
+    case NpcProcessPolicy::Player:   return "player";
+    case NpcProcessPolicy::AiNormal: return "normal";
+    case NpcProcessPolicy::AiFar:    return "far";
+    case NpcProcessPolicy::AiFar2:   return "far2";
+    }
+  return "unknown";
+  }
+
+const char* bodyStateName(BodyState bs) {
+  static const char* names[] = {
+    "stand", "walk", "sneak", "run", "sprint", "swim", "crawl", "dive", "jump", "climb",
+    "fall", "sit", "lie", "inventory", "item_interact", "mob_interact",
+    "mob_interact_interrupt", "take_item", "drop_item", "throw_item", "pickpocket",
+    "stumble", "unconscious", "dead", "aim_near", "aim_far", "hit", "parade", "casting",
+    "petrified", "controlling",
+    };
+  auto i = size_t(bs & BS_MAX);
+  return i<std::size(names) ? names[i] : "unknown";
+  }
+
+const char* actionName(Action a) {
+  switch(a) {
+    case AI_None:             return "none";
+    case AI_LookAtNpc:        return "look_at_npc";
+    case AI_StopLookAt:       return "stop_look_at";
+    case AI_RemoveWeapon:     return "remove_weapon";
+    case AI_TurnToNpc:        return "turn_to_npc";
+    case AI_GoToNpc:          return "go_to_npc";
+    case AI_GoToNextFp:       return "go_to_next_fp";
+    case AI_GoToPoint:        return "go_to_point";
+    case AI_StartState:       return "start_state";
+    case AI_PlayAnim:         return "play_anim";
+    case AI_PlayAnimBs:       return "play_anim_bs";
+    case AI_Wait:             return "wait";
+    case AI_StandUp:          return "stand_up";
+    case AI_StandUpQuick:     return "stand_up_quick";
+    case AI_EquipArmor:       return "equip_armor";
+    case AI_EquipBestArmor:   return "equip_best_armor";
+    case AI_EquipMelee:       return "equip_melee";
+    case AI_EquipRange:       return "equip_range";
+    case AI_UseMob:           return "use_mob";
+    case AI_UseItem:          return "use_item";
+    case AI_UseItemToState:   return "use_item_to_state";
+    case AI_Teleport:         return "teleport";
+    case AI_DrawWeaponMelee:  return "draw_weapon_melee";
+    case AI_DrawWeaponRange:  return "draw_weapon_range";
+    case AI_DrawSpell:        return "draw_spell";
+    case AI_Attack:           return "attack";
+    case AI_Flee:             return "flee";
+    case AI_Dodge:            return "dodge";
+    case AI_UnEquipWeapons:   return "unequip_weapons";
+    case AI_UnEquipArmor:     return "unequip_armor";
+    case AI_Output:           return "output";
+    case AI_OutputSvm:        return "output_svm";
+    case AI_OutputSvmOverlay: return "output_svm_overlay";
+    case AI_ProcessInfo:      return "process_info";
+    case AI_StopProcessInfo:  return "stop_process_info";
+    case AI_ContinueRoutine:  return "continue_routine";
+    case AI_AlignToFp:        return "align_to_fp";
+    case AI_AlignToWp:        return "align_to_wp";
+    case AI_SetNpcsToState:   return "set_npcs_to_state";
+    case AI_SetWalkMode:      return "set_walk_mode";
+    case AI_FinishingMove:    return "finishing_move";
+    case AI_DrawWeapon:       return "draw_weapon";
+    case AI_TakeItem:         return "take_item";
+    case AI_GotoItem:         return "go_to_item";
+    case AI_PointAtNpc:       return "point_at_npc";
+    case AI_PointAt:          return "point_at";
+    case AI_StopPointAt:      return "stop_point_at";
+    case AI_PrintScreen:      return "print_screen";
+    case AI_LookAt:           return "look_at";
+    case AI_WhirlToNpc:       return "whirl_to_npc";
+    case AI_TurnAway:         return "turn_away";
+    case AI_SidecarDone:      return "sidecar_done";
+    }
+  return "unknown";
+  }
+
+// Name of a script function such as an AI state; empty when unknown.
+std::string_view symbolName(World& world, const ScriptFn& fn) {
+  if(!fn.isValid())
+    return {};
+  auto* sym = world.script().findSymbol(fn.ptr);
+  return sym!=nullptr ? std::string_view(sym->name()) : std::string_view();
+  }
+
+void writePosition(Writer& w, const Npc& npc) {
+  auto pos = npc.position();
+  w.Key("position");
+  w.StartArray();
+  w.Double(double(pos.x));
+  w.Double(double(pos.y));
+  w.Double(double(pos.z));
+  w.EndArray();
+  }
+
+void writeName(Writer& w, const char* key, std::string_view name) {
+  if(name.empty())
+    return;
+  w.Key(key);
+  writeText(w,name);
+  }
+
 bool isReachable(World& world, const Npc& npc, const WayPoint& wp) {
   if(npc.qDistTo(&wp)<ArrivedDistance*ArrivedDistance)
     return true;
@@ -292,9 +407,10 @@ void Sidecar::tick(World& world) {
 
   if(&world!=lastWorld) {
     // new game, loaded save or another world: the Npc objects are new
-    lastWorld = &world;
+    lastWorld     = &world;
+    nextTelemetry = 0;
     for(auto& [id,c]:controlled) {
-      c.mode       = Mode::Idle;
+      setMode(world,c,Mode::Idle);
       c.hasPending = false;
       }
     }
@@ -303,6 +419,14 @@ void Sidecar::tick(World& world) {
     connect(world);
   if(fd>=0)
     receive(world);
+  if(fd>=0 && isActive()) {
+    checkDeadlines(world);
+    if(telemetryDirty || world.tickCount()>=nextTelemetry) {
+      sendTelemetry(world);
+      nextTelemetry  = world.tickCount() + TelemetryInterval;
+      telemetryDirty = false;
+      }
+    }
   if(fd>=0)
     flush();
   }
@@ -331,7 +455,6 @@ void Sidecar::connect(World& world) {
     return;
     }
   fd = s;
-  Log::i("sidecar: connected to ", socketPath);
 
   rapidjson::StringBuffer buf;
   Writer w(buf);
@@ -342,6 +465,8 @@ void Sidecar::connect(World& world) {
   w.Key("world");    writeText(w, world.name());
   w.EndObject();
   send({buf.GetString(), buf.GetSize()});
+  // after hello: the sidecar expects it first
+  note(false, "sidecar: connected to "+socketPath);
 #else
   (void)world;
   Log::e("sidecar: only supported on Linux");
@@ -429,7 +554,7 @@ void Sidecar::handle(World& world, std::string_view json) {
   rapidjson::Document doc;
   doc.Parse(json.data(), json.size());
   if(doc.HasParseError() || !doc.IsObject()) {
-    Log::e("sidecar: malformed message");
+    note(true, "sidecar: malformed message");
     return;
     }
 
@@ -437,11 +562,11 @@ void Sidecar::handle(World& world, std::string_view json) {
   if(type=="welcome")
     onWelcome(world,doc);
   else if(type=="intent")
-    onIntent(doc);
+    onIntent(world,doc);
   else if(type=="pass")
-    onPass(doc);
+    onPass(world,doc);
   else
-    Log::e("sidecar: unknown message type: ", type);
+    note(true, "sidecar: unknown message type: "+std::string(type));
   }
 
 void Sidecar::onWelcome(World& world, const rapidjson::Value& msg) {
@@ -458,37 +583,41 @@ void Sidecar::onWelcome(World& world, const rapidjson::Value& msg) {
       std::string_view name(v.GetString(), v.GetStringLength());
       auto id = world.script().findSymbolIndex(name);
       if(id==size_t(-1)) {
-        Log::e("sidecar: unknown NPC instance: ", name);
+        note(true, "sidecar: unknown NPC instance: "+std::string(name));
         continue;
         }
-      controlled[id].name = std::string(name);
+      auto& c = controlled[id];
+      c.name = std::string(name);
+      setMode(world,c,Mode::Idle);
       }
     }
-  Log::i("sidecar: controlling ", int(controlled.size()), " NPC(s)");
+  note(false, "sidecar: controlling "+std::to_string(controlled.size())+" NPC(s)");
   }
 
-void Sidecar::onIntent(const rapidjson::Value& msg) {
+void Sidecar::onIntent(World& world, const rapidjson::Value& msg) {
   uint32_t intent = 0;
   if(!u32(msg,"intent",intent)) {
-    Log::e("sidecar: intent without an id");
+    note(true, "sidecar: intent without an id");
     return;
     }
-  auto* c = find(str(msg,"npc"));
+  auto  npc    = str(msg,"npc");
+  auto  reject = [&](std::string_view reason) { sendResult(world,npc,intent,"rejected",reason); };
+  auto* c      = find(npc);
   if(c==nullptr)
-    return sendResult(intent,"rejected","NPC is not controlled");
+    return reject("NPC is not controlled");
 
   uint32_t request = 0;
   if(u32(msg,"request",request) && (c->mode!=Mode::Awaiting || request!=c->request))
-    return sendResult(intent,"rejected","stale request");
+    return reject("stale request");
 
   auto it = msg.FindMember("actions");
   if(it==msg.MemberEnd() || !it->value.IsArray())
-    return sendResult(intent,"rejected","no actions");
+    return reject("no actions");
 
   std::vector<Action> actions;
   for(auto& v:it->value.GetArray()) {
     if(!v.IsObject())
-      return sendResult(intent,"rejected","malformed action");
+      return reject("malformed action");
     Action a;
     auto kind = str(v,"action");
     if(kind=="go_to") {
@@ -498,7 +627,7 @@ void Sidecar::onIntent(const rapidjson::Value& msg) {
     else if(kind=="wait") {
       a.kind = Action::Wait;
       if(!u32(v,"ms",a.ms))
-        return sendResult(intent,"rejected","wait without ms");
+        return reject("wait without ms");
       }
     else if(kind=="say") {
       a.kind   = Action::Say;
@@ -506,24 +635,24 @@ void Sidecar::onIntent(const rapidjson::Value& msg) {
       a.target = std::string(str(v,"target"));
       }
     else {
-      return sendResult(intent,"rejected","unknown action: "+std::string(kind));
+      return reject("unknown action: "+std::string(kind));
       }
     actions.push_back(std::move(a));
     }
 
   if(c->hasPending)
-    sendResult(c->pendingIntent,"rejected","superseded");
+    sendResult(world,c->name,c->pendingIntent,"rejected","superseded");
   // applied at the NPC's next decision point, when it is idle
   c->hasPending    = true;
   c->pendingIntent = intent;
   c->pending       = std::move(actions);
   }
 
-void Sidecar::onPass(const rapidjson::Value& msg) {
+void Sidecar::onPass(World& world, const rapidjson::Value& msg) {
   uint32_t request = 0;
   auto*    c       = find(str(msg,"npc"));
   if(c!=nullptr && u32(msg,"request",request) && c->mode==Mode::Awaiting && request==c->request)
-    c->mode = Mode::Vanilla;
+    setMode(world,*c,Mode::Vanilla);
   }
 
 Sidecar::Controlled* Sidecar::find(Npc& npc) {
@@ -545,31 +674,48 @@ Sidecar::Controlled* Sidecar::find(std::string_view name) {
   return nullptr;
   }
 
+const char* Sidecar::modeName(Mode mode) {
+  switch(mode) {
+    case Mode::Idle:     return "idle";
+    case Mode::Awaiting: return "awaiting";
+    case Mode::Running:  return "running";
+    case Mode::Vanilla:  return "vanilla";
+    }
+  return "unknown";
+  }
+
+void Sidecar::setMode(World& world, Controlled& c, Mode mode) {
+  c.mode         = mode;
+  c.modeSince    = world.time().toInt();
+  c.modeTick     = world.tickCount();
+  telemetryDirty = true;
+  }
+
 bool Sidecar::onDecisionPoint(Npc& npc, bool inRoutineState) {
   auto* c = find(npc);
   if(c==nullptr)
     return false;
 
+  auto& world = npc.world();
   if(c->hasPending) {
     if(applyPending(npc,*c))
       return true;
-    c->mode = Mode::Idle; // rejected: ask again
+    setMode(world,*c,Mode::Idle); // rejected: ask again
     }
 
   switch(c->mode) {
     case Mode::Awaiting:
-      if(Clock::now()-c->since<DecideTimeout)
+      if(world.tickCount()-c->modeTick<DecideTimeout)
         return true;
-      Log::i("sidecar: decision for ", c->name, " timed out");
-      c->mode = Mode::Vanilla;
+      note(false, "sidecar: decision for "+c->name+" timed out");
+      setMode(world,*c,Mode::Vanilla);
       return false;
     case Mode::Vanilla:
       if(inRoutineState)
         return false;
       break;
     case Mode::Running:
-      // the queue ran empty without reaching the completion marker
-      sendResult(c->intent,"aborted");
+      sendResult(world,c->name,c->intent,"aborted",AbortQueueRanEmpty);
       break;
     case Mode::Idle:
       break;
@@ -581,8 +727,7 @@ bool Sidecar::onDecisionPoint(Npc& npc, bool inRoutineState) {
 void Sidecar::requestDecision(Npc& npc, Controlled& c) {
   auto& world = npc.world();
   c.request = nextRequest++;
-  c.mode    = Mode::Awaiting;
-  c.since   = Clock::now();
+  setMode(world,c,Mode::Awaiting);
 
   rapidjson::StringBuffer buf;
   Writer w(buf);
@@ -622,7 +767,7 @@ bool Sidecar::applyPending(Npc& npc, Controlled& c) {
   c.hasPending = false;
   auto& world  = npc.world();
   auto  reject = [&](std::string_view reason) {
-    sendResult(c.pendingIntent,"rejected",reason);
+    sendResult(world,c.name,c.pendingIntent,"rejected",reason);
     return false;
     };
 
@@ -665,9 +810,10 @@ bool Sidecar::applyPending(Npc& npc, Controlled& c) {
   for(auto& a:queue)
     npc.aiPush(std::move(a));
 
-  c.mode   = Mode::Running;
-  c.intent = c.pendingIntent;
+  c.intent   = c.pendingIntent;
+  c.deadline = world.tickCount() + RunTimeout;
   c.pending.clear();
+  setMode(world,c,Mode::Running);
   return true;
   }
 
@@ -675,16 +821,124 @@ void Sidecar::onIntentDone(Npc& npc, uint32_t intent) {
   auto* c = find(npc);
   if(c==nullptr || c->mode!=Mode::Running || c->intent!=intent)
     return;
-  c->mode = Mode::Idle;
-  sendResult(intent,"done");
+  setMode(npc.world(),*c,Mode::Idle);
+  sendResult(npc.world(),c->name,intent,"done");
   }
 
 void Sidecar::onAiQueueCleared(Npc& npc) {
   auto* c = find(npc);
   if(c==nullptr || c->mode!=Mode::Running)
     return;
-  c->mode = Mode::Idle;
-  sendResult(c->intent,"aborted");
+  setMode(npc.world(),*c,Mode::Idle);
+  sendResult(npc.world(),c->name,c->intent,"aborted",AbortQueueCleared);
+  }
+
+void Sidecar::checkDeadlines(World& world) {
+  for(auto& [id,c]:controlled) {
+    if(c.mode!=Mode::Running || world.tickCount()<c.deadline)
+      continue;
+    setMode(world,c,Mode::Idle);
+    sendResult(world,c.name,c.intent,"aborted",AbortTimeout);
+    // no longer Running, so onAiQueueCleared stays silent
+    if(auto* npc = world.findNpcByInstance(id))
+      npc->clearAiQueue();
+    }
+  }
+
+void Sidecar::sendTelemetry(World& world) {
+  auto* pl = world.player();
+
+  std::vector<std::pair<size_t,const Controlled*>> npcs;
+  for(auto& [id,c]:controlled)
+    npcs.emplace_back(id,&c);
+  std::sort(npcs.begin(), npcs.end(), [](const auto& a, const auto& b) {
+    return a.second->name<b.second->name;
+    });
+
+  rapidjson::StringBuffer buf;
+  Writer w(buf);
+  w.StartObject();
+  w.Key("type"); w.String("telemetry");
+  w.Key("time"); w.Int64(world.time().toInt());
+  w.Key("tick"); w.Uint64(world.tickCount());
+  if(pl!=nullptr) {
+    w.Key("player");
+    w.StartObject();
+    writePosition(w,*pl);
+    if(auto* wp = world.findWayPoint(pl->position()))
+      writeName(w,"waypoint",wp->name);
+    w.EndObject();
+    }
+
+  w.Key("npcs");
+  w.StartArray();
+  for(auto& [id,c]:npcs) {
+    w.StartObject();
+    w.Key("npc");        writeText(w,c->name);
+    w.Key("mode");       w.String(modeName(c->mode));
+    w.Key("mode_since"); w.Int64(c->modeSince);
+    if(c->mode==Mode::Awaiting) {
+      w.Key("request");
+      w.Uint(c->request);
+      }
+    if(c->mode==Mode::Running) {
+      w.Key("intent");
+      w.Uint(c->intent);
+      }
+
+    if(auto* npc = world.findNpcByInstance(id)) {
+      w.Key("world");
+      w.StartObject();
+      w.Key("ai"); w.String(aiName(npc->processPolicy()));
+      writeName(w,"state",  symbolName(world,npc->aiState.funcIni));
+      writeName(w,"routine",symbolName(world,npc->currentRoutine().callback));
+      w.Key("body_state"); w.String(bodyStateName(npc->bodyStateMasked()));
+
+      auto& queue = npc->aiQueue.aiActions;
+      w.Key("queue");
+      w.StartArray();
+      for(size_t i=0; i<queue.size() && i<MaxQueueShown; ++i)
+        w.String(actionName(queue[i].act));
+      w.EndArray();
+      w.Key("queue_len"); w.Uint(uint32_t(queue.size()));
+
+      if(npc->go2.flag!=Npc::GT_No && npc->go2.wp!=nullptr)
+        writeName(w,"next_waypoint",npc->go2.wp->name);
+      if(auto* last = npc->wayPath.last())
+        writeName(w,"destination",last->name);
+      if(auto* mob = npc->interactive())
+        writeName(w,"using",mob->schemeName());
+      if(auto* wp = world.findWayPoint(npc->position()))
+        writeName(w,"waypoint",wp->name);
+      writePosition(w,*npc);
+      if(pl!=nullptr) {
+        w.Key("player_distance");
+        w.Double(double(std::sqrt(npc->qDistTo(*pl))));
+        }
+      w.EndObject();
+      }
+    w.EndObject();
+    }
+  w.EndArray();
+  w.EndObject();
+  send({buf.GetString(), buf.GetSize()});
+  }
+
+void Sidecar::note(bool error, std::string_view text) {
+  if(error)
+    Log::e(text); else
+    Log::i(text);
+  if(fd<0)
+    return;
+
+  rapidjson::StringBuffer buf;
+  Writer w(buf);
+  w.StartObject();
+  w.Key("type");  w.String("log");
+  w.Key("level"); w.String(error ? "error" : "info");
+  w.Key("text");  writeText(w,text);
+  w.EndObject();
+  send({buf.GetString(), buf.GetSize()});
   }
 
 void Sidecar::onPerception(Npc& npc, Npc& other, PercType perc) {
@@ -708,12 +962,15 @@ void Sidecar::onPerception(Npc& npc, Npc& other, PercType perc) {
   send({buf.GetString(), buf.GetSize()});
   }
 
-void Sidecar::sendResult(uint32_t intent, std::string_view status, std::string_view reason) {
+void Sidecar::sendResult(World& world, std::string_view npc, uint32_t intent,
+                         std::string_view status, std::string_view reason) {
   rapidjson::StringBuffer buf;
   Writer w(buf);
   w.StartObject();
   w.Key("type");   w.String("result");
   w.Key("intent"); w.Uint(intent);
+  w.Key("npc");    writeText(w,npc);
+  w.Key("time");   w.Int64(world.time().toInt());
   w.Key("outcome");
   w.StartObject();
   w.Key("status"); w.String(status.data(), rapidjson::SizeType(status.size()));

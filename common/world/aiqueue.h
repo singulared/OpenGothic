@@ -95,5 +95,7 @@ class AiQueue {
 
   private:
     std::deque<AiAction> aiActions;
+
+  friend class Sidecar;
   };
 

@@ -637,4 +637,5 @@ class Npc final {
     Sound                          sfxWeapon;
 
   friend class MoveAlgo;
+  friend class Sidecar;
   };
