@@ -6,6 +6,7 @@
 #include "graphics/mesh/skeleton.h"
 #include "graphics/visualfx.h"
 #include "game/damagecalculator.h"
+#include "sidecar/sidecar.h"
 #include "game/serialize.h"
 #include "game/gamescript.h"
 #include "utils/string_frm.h"
@@ -2886,6 +2887,9 @@ void Npc::nextAiAction(AiQueue& queue, uint64_t dt) {
       visual.stopAnim(*this,"T_POINT");
       break;
       }
+    case AI_SidecarDone:
+      Sidecar::inst().onIntentDone(*this,uint32_t(act.i0));
+      break;
     case AI_PrintScreen:{
       auto  msg     = act.s0;
       auto  posx    = act.i0;
@@ -3002,6 +3006,15 @@ bool Npc::isPlayerEnabledState(const ::AiState& st) const {
   }
 
 void Npc::tickRoutine() {
+  auto& sidecar = Sidecar::inst();
+  if(sidecar.isActive() && !isPlayer() && (!aiState.funcIni.isValid() || isInRoutine(aiState.funcIni)) &&
+     sidecar.onDecisionPoint(*this,aiState.funcIni.isValid())) {
+    // the sidecar drives this NPC: leave the routine state, perceptions stay enabled
+    if(aiState.funcIni.isValid())
+      clearState(false);
+    return;
+    }
+
   if(!aiState.funcIni.isValid() && !isPlayer()) {
     auto r = currentRoutine();
     if(r.callback.isValid()) {
@@ -4245,6 +4258,7 @@ bool Npc::perceptionProcess(Npc &pl, Npc* victim, float quadDist, PercType perc)
     return false;
 
   if(hasPerc(perc)) {
+    Sidecar::inst().onPerception(*this,pl,perc);
     owner.script().invokeState(this,&pl,victim,perception[perc].func);
     return true;
     }
@@ -4531,6 +4545,7 @@ bool Npc::isAiBusy() const {
   }
 
 void Npc::clearAiQueue() {
+  Sidecar::inst().onAiQueueCleared(*this);
   currentLookAt    = nullptr;
   currentLookAtNpc = nullptr;
   visual.setHeadRotation(0,0);

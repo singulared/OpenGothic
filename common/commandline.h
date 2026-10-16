@@ -48,6 +48,7 @@ class CommandLine {
     bool                doForceG2NR()      const { return forceG2NR;    }
     bool                aaPreset()         const { return aaPresetId;   }
     std::string_view    defaultSave()      const { return saveDef;    }
+    std::string_view    sidecarSocket()    const { return sidecarSock; }
 
     std::string         wrldDef;
 
@@ -59,6 +60,7 @@ class CommandLine {
     std::u16string      gscript;
     std::u16string      gcutscene;
     std::string         saveDef;
+    std::string         sidecarSock;
     bool                devmode      = false;
     bool                noMenu       = false;
     Benchmark           isBenchmark  = Benchmark::None;

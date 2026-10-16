@@ -64,6 +64,11 @@ CommandLine::CommandLine(int argc, const char** argv) {
       if(i<argc)
         gpath.assign(argv[i],argv[i]+std::strlen(argv[i]));
       }
+    else if(arg=="-sidecar") {
+      ++i;
+      if(i<argc)
+        sidecarSock = argv[i];
+      }
     else if(arg=="-devmode") {
       // http://www.gothic-library.ru/publ/marvin/1-1-0-547
       devmode = true;

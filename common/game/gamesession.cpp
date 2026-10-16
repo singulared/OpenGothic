@@ -14,6 +14,7 @@
 #include "serialize.h"
 #include "camera.h"
 #include "gothic.h"
+#include "sidecar/sidecar.h"
 
 using namespace Tempest;
 
@@ -317,6 +318,7 @@ void GameSession::tick(uint64_t dt) {
   wrldTime.addMilis(add/divTime);
 
   vm->tick(dt);
+  Sidecar::inst().tick(*wrld);
   wrld->tick(dt);
   // std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
